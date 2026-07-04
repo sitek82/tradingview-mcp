@@ -89,18 +89,43 @@ export async function manageIndicator({ action, indicator, entity_id, inputs: in
   const inputs = inputsRaw ? (typeof inputsRaw === 'string' ? JSON.parse(inputsRaw) : inputsRaw) : undefined;
 
   if (action === 'add') {
-    const inputArr = inputs ? Object.entries(inputs).map(([k, v]) => ({ id: k, value: v })) : [];
     const before = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
     await evaluate(`
       (function() {
         var chart = ${CHART_API};
-        chart.createStudy(${safeString(indicator)}, false, false, ${JSON.stringify(inputArr)});
+        chart.createStudy(${safeString(indicator)}, false, false, []);
       })()
     `);
     await new Promise(r => setTimeout(r, 1500));
-    const after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
-    const newIds = (after || []).filter(id => !(before || []).includes(id));
-    return { success: newIds.length > 0, action: 'add', indicator, entity_id: newIds[0] || null, new_study_count: newIds.length };
+    let after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+    let newIds = (after || []).filter(id => !(before || []).includes(id));
+    let entityId = newIds[0] || null;
+
+    // createStudy's overrides argument only accepts a positional value array (matching
+    // getInputsInfo() order), not {id, value} pairs — that form is silently ignored.
+    // We don't know the order up front, so create with defaults, read the order back,
+    // then remove + recreate with the correctly-positioned values.
+    if (entityId && inputs && Object.keys(inputs).length > 0) {
+      await evaluate(`
+        (function() {
+          var chart = ${CHART_API};
+          var study = chart.getStudyById(${safeString(entityId)});
+          var info = study.getInputsInfo();
+          var overrides = ${JSON.stringify(inputs)};
+          var positional = info.map(function(inp) {
+            return overrides.hasOwnProperty(inp.id) ? overrides[inp.id] : inp.defval;
+          });
+          chart.removeEntity(${safeString(entityId)});
+          chart.createStudy(${safeString(indicator)}, false, false, positional);
+        })()
+      `);
+      await new Promise(r => setTimeout(r, 1500));
+      after = await evaluate(`${CHART_API}.getAllStudies().map(function(s) { return s.id; })`);
+      newIds = (after || []).filter(id => !(before || []).includes(id));
+      entityId = newIds[0] || entityId;
+    }
+
+    return { success: !!entityId, action: 'add', indicator, entity_id: entityId, new_study_count: newIds.length };
   } else if (action === 'remove') {
     if (!entity_id) throw new Error('entity_id required for remove action. Use chart_get_state to find study IDs.');
     await evaluate(`
