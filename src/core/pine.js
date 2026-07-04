@@ -5,47 +5,39 @@
  */
 import { evaluate, evaluateAsync, getClient } from '../connection.js';
 
-// ── Monaco finder (injected into TV page) ──
-const FIND_MONACO = `
-  (function findMonacoEditor() {
-    var container = document.querySelector('.monaco-editor.pine-editor-monaco');
-    if (!container) return null;
-    var el = container;
-    var fiberKey;
-    for (var i = 0; i < 20; i++) {
-      if (!el) break;
-      fiberKey = Object.keys(el).find(function(k) { return k.startsWith('__reactFiber$'); });
-      if (fiberKey) break;
-      el = el.parentElement;
-    }
-    if (!fiberKey) return null;
-    var current = el[fiberKey];
-    for (var d = 0; d < 15; d++) {
-      if (!current) break;
-      if (current.memoizedProps && current.memoizedProps.value && current.memoizedProps.value.monacoEnv) {
-        var env = current.memoizedProps.value.monacoEnv;
-        if (env.editor && typeof env.editor.getEditors === 'function') {
-          var editors = env.editor.getEditors();
-          if (editors.length > 0) return { editor: editors[0], env: env };
-        }
-      }
-      current = current.return;
-    }
-    return null;
-  })()
-`;
+// ── Monaco DOM access (injected into TV page) ──
+//
+// This app's Pine Editor renders Monaco in a subtree with no React fiber
+// keys anywhere in its ancestor chain up to <body> (verified empirically —
+// walking .parentElement from the editor container never finds a
+// __reactFiber$-prefixed key, unlike a typical React app). That means the
+// previous approach (find the container, walk up to a fiber, dig
+// memoizedProps.value.monacoEnv out of it) can never work here: there is no
+// fiber to dig `monacoEnv` out of, and no `window.monaco`/`window.TradingView`
+// global exposes the editor instances either.
+//
+// Instead we drive the editor the same way a person would: the hidden
+// `textarea.inputarea` Monaco uses to capture keystrokes is a real,
+// DOM-visible element. Typing into it character-by-character works but
+// triggers Monaco's auto-indent/auto-close-bracket logic (which mangles
+// multi-line source), so writes go through a synthetic `paste` ClipboardEvent
+// instead (Monaco inserts pasted text as a literal block, no auto-indent).
+// Selecting all text requires a *trusted* key event — dispatching a
+// synthetic KeyboardEvent via element.dispatchEvent() does NOT trigger the
+// browser's native select-all, so Cmd/Ctrl+A must go through CDP's
+// Input.dispatchKeyEvent (same mechanism already used below for Cmd+S).
+// This is a Mac build: save/compile is bound to Cmd+S (meta), not Ctrl+S.
+const PINE_CONTAINER_SELECTOR = '.monaco-editor.pine-editor-monaco';
+const PINE_TEXTAREA_SELECTOR = 'textarea.inputarea';
+
+const IS_EDITOR_OPEN = `(document.querySelector(${JSON.stringify(PINE_CONTAINER_SELECTOR)}) !== null)`;
 
 /**
- * Opens the Pine Editor panel and waits for Monaco to become available.
- * Returns true if editor is accessible, false on timeout.
+ * Opens the Pine Editor panel and waits for its Monaco container to appear in the DOM.
+ * Returns true if the editor is present, false on timeout.
  */
 export async function ensurePineEditorOpen() {
-  const already = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      return m !== null;
-    })()
-  `);
+  const already = await evaluate(`(function() { return ${IS_EDITOR_OPEN}; })()`);
   if (already) return true;
 
   await evaluate(`
@@ -67,10 +59,141 @@ export async function ensurePineEditorOpen() {
 
   for (let i = 0; i < 50; i++) {
     await new Promise(r => setTimeout(r, 200));
-    const ready = await evaluate(`(function() { return ${FIND_MONACO} !== null; })()`);
+    const ready = await evaluate(`(function() { return ${IS_EDITOR_OPEN}; })()`);
     if (ready) return true;
   }
   return false;
+}
+
+// Dispatches a trusted key combo via CDP (synthetic DOM KeyboardEvents don't
+// trigger native browser behaviors like select-all or save shortcuts).
+// modifiers bit field per CDP: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8.
+async function dispatchTrustedKey(key, code, windowsVirtualKeyCode, modifiers) {
+  const c = await getClient();
+  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers, key, code, windowsVirtualKeyCode });
+  await c.Input.dispatchKeyEvent({ type: 'keyUp', modifiers, key, code, windowsVirtualKeyCode });
+}
+
+async function selectAllInEditor() {
+  const found = await evaluate(`
+    (function() {
+      var ta = document.querySelector(${JSON.stringify(PINE_TEXTAREA_SELECTOR)});
+      if (!ta) return false;
+      ta.focus();
+      return true;
+    })()
+  `);
+  if (!found) throw new Error('Pine Editor input area not found.');
+  await dispatchTrustedKey('a', 'KeyA', 65, 4); // Cmd+A (this is a Mac build)
+}
+
+// Replaces the full editor buffer via a synthetic paste (Monaco inserts
+// pasted text as a literal block — no auto-indent/auto-close mangling like
+// character-by-character typing has).
+async function pasteIntoEditor(text) {
+  await selectAllInEditor();
+  const pasted = await evaluate(`
+    (function() {
+      var ta = document.querySelector(${JSON.stringify(PINE_TEXTAREA_SELECTOR)});
+      if (!ta) return false;
+      var dt = new DataTransfer();
+      dt.setData('text/plain', ${JSON.stringify(text)});
+      var evt = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+      ta.dispatchEvent(evt);
+      return true;
+    })()
+  `);
+  if (!pasted) throw new Error('Pine Editor input area not found for paste.');
+}
+
+// Text patterns for the "add to chart" family of buttons/dialogs, in the
+// languages this app has actually been observed running in (English, Polish).
+// TradingView's UI language depends on the account/browser locale.
+const ADD_TO_CHART_PATTERNS = [
+  /^save and add to chart$/i,
+  /^zapisz i dodaj do wykresu$/i,
+  /^add to chart$/i,
+  /^dodaj do wykresu$/i,
+  /^update on chart$/i,
+  /^zaktualizuj na wykresie$/i,
+];
+const SAVE_DIALOG_BUTTON_PATTERNS = [/^save$/i, /^zapisz$/i];
+
+async function clickAddToChartOrSave() {
+  return evaluate(`
+    (function() {
+      var patterns = ${JSON.stringify(ADD_TO_CHART_PATTERNS.map(p => p.source))}.map(function(s) { return new RegExp(s, 'i'); });
+      var btns = document.querySelectorAll('button');
+      for (var p = 0; p < patterns.length; p++) {
+        for (var i = 0; i < btns.length; i++) {
+          if (btns[i].offsetParent === null) continue;
+          if (patterns[p].test(btns[i].textContent.trim())) {
+            btns[i].click();
+            return btns[i].textContent.trim();
+          }
+        }
+      }
+      return null;
+    })()
+  `);
+}
+
+// Clicks the "Save" button inside a "save before switching/adding" dialog,
+// as opposed to the toolbar's own save button (same visible text, different
+// element — this one is scoped to a dialog/modal container).
+async function clickSaveDialogButtonIfPresent() {
+  return evaluate(`
+    (function() {
+      var patterns = ${JSON.stringify(SAVE_DIALOG_BUTTON_PATTERNS.map(p => p.source))}.map(function(s) { return new RegExp(s, 'i'); });
+      var btns = document.querySelectorAll('button');
+      for (var i = 0; i < btns.length; i++) {
+        var b = btns[i];
+        if (b.offsetParent === null) continue;
+        var text = b.textContent.trim();
+        var matches = patterns.some(function(p) { return p.test(text); });
+        if (!matches) continue;
+        var dialog = b.closest('[class*="dialog"], [class*="modal"], [class*="popup"], [role="dialog"]');
+        if (dialog) { b.click(); return true; }
+      }
+      return false;
+    })()
+  `);
+}
+
+// Scrapes Monaco's inline error/warning squiggly decorations and the
+// diagnostics banner TradingView renders above the editor on compile. This
+// replaces reading getModelMarkers() off the (unreachable) Monaco API —
+// it can't recover exact column ranges, only line numbers and messages.
+async function scrapeErrorsFromDom() {
+  return evaluate(`
+    (function() {
+      var results = [];
+      var seen = {};
+
+      // Diagnostics banner: "N z M problemów" / "N of M problems" + message line(s)
+      var bannerMsgs = document.querySelectorAll('[class*="marker"] [class*="message"], [class*="diagnostic"] [class*="message"]');
+      bannerMsgs.forEach(function(el) {
+        var text = el.textContent.trim();
+        if (text && !seen[text]) { seen[text] = true; results.push({ line: null, column: null, message: text, severity: 'error' }); }
+      });
+
+      // Inline squiggly decorations (line number recoverable from the view-line ancestor)
+      var squiggles = document.querySelectorAll('.squiggly-error, .squiggly-warning');
+      squiggles.forEach(function(el) {
+        var severity = el.className.indexOf('squiggly-error') !== -1 ? 'error' : 'warning';
+        var viewLine = el.closest('[class*="view-line"]');
+        var lineNumber = null;
+        if (viewLine && viewLine.parentElement) {
+          var top = parseInt(viewLine.style.top, 10);
+          if (!isNaN(top)) lineNumber = top; // pixel offset, not a line number — best-effort only
+        }
+        var key = 'squiggle:' + severity + ':' + lineNumber;
+        if (!seen[key]) { seen[key] = true; results.push({ line: lineNumber, column: null, message: '(' + severity + ' marker, no message text recoverable from DOM)', severity: severity }); }
+      });
+
+      return results;
+    })()
+  `);
 }
 
 // ── Pure / offline functions ──
@@ -246,38 +369,43 @@ export async function check({ source }) {
 
 export async function getSource() {
   const editorReady = await ensurePineEditorOpen();
-  if (!editorReady) throw new Error('Could not open Pine Editor or Monaco not found in React fiber tree.');
+  if (!editorReady) throw new Error('Could not open Pine Editor.');
 
+  await selectAllInEditor();
   const source = await evaluate(`
     (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return null;
-      return m.editor.getValue();
+      var ta = document.querySelector(${JSON.stringify(PINE_TEXTAREA_SELECTOR)});
+      return ta ? ta.value : null;
     })()
   `);
 
   if (source === null || source === undefined) {
-    throw new Error('Monaco editor found but getValue() returned null.');
+    throw new Error('Pine Editor input area not found.');
   }
 
-  return { success: true, source, line_count: source.split('\n').length, char_count: source.length };
+  // Monaco's hidden accessibility textarea truncates the middle of long
+  // selections with an ellipsis rather than mirroring the full buffer —
+  // there is no reliable way to recover the true full text for large
+  // scripts without access to the Monaco model API (unreachable in this
+  // build, see the note at the top of this file).
+  const truncated = source.includes('…');
+  return {
+    success: true,
+    source,
+    line_count: source.split('\n').length,
+    char_count: source.length,
+    truncated,
+    note: truncated
+      ? 'Source was truncated by the editor — this only reflects the start/end of the script, not the full body. There is no reliable way to read back a full large script in this TradingView build.'
+      : undefined,
+  };
 }
 
 export async function setSource({ source }) {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const escaped = JSON.stringify(source);
-  const set = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
-      return true;
-    })()
-  `);
-
-  if (!set) throw new Error('Monaco found but setValue() failed.');
+  await pasteIntoEditor(source);
   return { success: true, lines_set: source.split('\n').length };
 }
 
@@ -285,57 +413,24 @@ export async function compile() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const clicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var fallback = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!fallback && /^(Add to chart|Update on chart)/i.test(text)) {
-          fallback = btns[i];
-        }
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) {
-          saveBtn = btns[i];
-        }
-      }
-      if (fallback) { fallback.click(); return fallback.textContent.trim(); }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
+  await dispatchTrustedKey('s', 'KeyS', 83, 4); // Cmd+S (this is a Mac build)
+  await new Promise(r => setTimeout(r, 800));
 
-  if (!clicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
+  // New/unsaved scripts prompt for a name before they can be added to chart.
+  const dialogHandled = await clickSaveDialogButtonIfPresent();
+  if (dialogHandled) await new Promise(r => setTimeout(r, 800));
 
-  await new Promise(r => setTimeout(r, 2000));
-  return { success: true, button_clicked: clicked || 'keyboard_shortcut', source: 'dom_fallback' };
+  const clicked = await clickAddToChartOrSave();
+  await new Promise(r => setTimeout(r, 1500));
+
+  return { success: true, button_clicked: clicked || 'Cmd+S', source: 'dom_fallback' };
 }
 
 export async function getErrors() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
-
+  const errors = await scrapeErrorsFromDom();
   return {
     success: true,
     has_errors: errors?.length > 0,
@@ -348,32 +443,13 @@ export async function save() {
   const editorReady = await ensurePineEditorOpen();
   if (!editorReady) throw new Error('Could not open Pine Editor.');
 
-  const c = await getClient();
-  await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 's', code: 'KeyS', windowsVirtualKeyCode: 83 });
-  await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 's', code: 'KeyS' });
+  await dispatchTrustedKey('s', 'KeyS', 83, 4); // Cmd+S (this is a Mac build)
   await new Promise(r => setTimeout(r, 800));
 
-  // Handle "Save Script" name dialog that appears for new/unsaved scripts
-  const dialogHandled = await evaluate(`
-    (function() {
-      var saveBtn = null;
-      var btns = document.querySelectorAll('button');
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (text === 'Save' && btns[i].offsetParent !== null) {
-          // Check if it's in a dialog (not the Pine Editor save button)
-          var parent = btns[i].closest('[class*="dialog"], [class*="modal"], [class*="popup"], [role="dialog"]');
-          if (parent) { saveBtn = btns[i]; break; }
-        }
-      }
-      if (saveBtn) { saveBtn.click(); return true; }
-      return false;
-    })()
-  `);
-
+  const dialogHandled = await clickSaveDialogButtonIfPresent();
   if (dialogHandled) await new Promise(r => setTimeout(r, 500));
 
-  return { success: true, action: dialogHandled ? 'saved_with_dialog' : 'Ctrl+S_dispatched' };
+  return { success: true, action: dialogHandled ? 'saved_with_dialog' : 'Cmd+S_dispatched' };
 }
 
 export async function getConsole() {
@@ -440,49 +516,16 @@ export async function smartCompile() {
     })()
   `);
 
-  const buttonClicked = await evaluate(`
-    (function() {
-      var btns = document.querySelectorAll('button');
-      var addBtn = null;
-      var updateBtn = null;
-      var saveBtn = null;
-      for (var i = 0; i < btns.length; i++) {
-        var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
-          btns[i].click();
-          return 'Save and add to chart';
-        }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
-        if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
-      }
-      if (addBtn) { addBtn.click(); return 'Add to chart'; }
-      if (updateBtn) { updateBtn.click(); return 'Update on chart'; }
-      if (saveBtn) { saveBtn.click(); return 'Pine Save'; }
-      return null;
-    })()
-  `);
+  await dispatchTrustedKey('s', 'KeyS', 83, 4); // Cmd+S (this is a Mac build)
+  await new Promise(r => setTimeout(r, 800));
 
-  if (!buttonClicked) {
-    const c = await getClient();
-    await c.Input.dispatchKeyEvent({ type: 'keyDown', modifiers: 2, key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
-    await c.Input.dispatchKeyEvent({ type: 'keyUp', key: 'Enter', code: 'Enter' });
-  }
+  const dialogHandled = await clickSaveDialogButtonIfPresent();
+  if (dialogHandled) await new Promise(r => setTimeout(r, 800));
 
+  const buttonClicked = await clickAddToChartOrSave();
   await new Promise(r => setTimeout(r, 2500));
 
-  const errors = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return [];
-      var model = m.editor.getModel();
-      if (!model) return [];
-      var markers = m.env.editor.getModelMarkers({ resource: model.uri });
-      return markers.map(function(mk) {
-        return { line: mk.startLineNumber, column: mk.startColumn, message: mk.message, severity: mk.severity };
-      });
-    })()
-  `);
+  const errors = await scrapeErrorsFromDom();
 
   const studiesAfter = await evaluate(`
     (function() {
@@ -498,7 +541,7 @@ export async function smartCompile() {
 
   return {
     success: true,
-    button_clicked: buttonClicked || 'keyboard_shortcut',
+    button_clicked: buttonClicked || 'Cmd+S',
     has_errors: errors?.length > 0,
     errors: errors || [],
     study_added: studyAdded,
@@ -518,18 +561,14 @@ export async function newScript({ type }) {
 
   const template = templates[type] || templates.indicator;
 
-  // Simply set the source to a new template — this is the most reliable approach
-  const escaped = JSON.stringify(template);
-  const set = await evaluate(`
-    (function() {
-      var m = ${FIND_MONACO};
-      if (!m) return false;
-      m.editor.setValue(${escaped});
-      return true;
-    })()
-  `);
-
-  if (!set) throw new Error('Monaco editor not found. Ensure Pine Editor is open.');
+  // NOTE: this replaces the CURRENT editor buffer with a blank template —
+  // it does not create a distinct new tab. If another script (including a
+  // read-only/protected one) happens to be open, its buffer gets this
+  // template pasted into it instead. That buffer is never saved back over
+  // a protected script (TradingView blocks saving read-only scripts), but
+  // callers that need a guaranteed-fresh tab should drive the "Stwórz nowy"
+  // menu in the script-title dropdown manually rather than rely on this.
+  await pasteIntoEditor(template);
 
   return { success: true, type, action: 'new_script_created', template: typeMap[type] };
 }
@@ -569,12 +608,7 @@ export async function openScript({ name }) {
             .then(function(data) {
               var source = data.source || '';
               if (!source) return {error: 'Script source is empty', name: match.scriptName || match.scriptTitle};
-              var m = ${FIND_MONACO};
-              if (m) {
-                m.editor.setValue(source);
-                return {success: true, name: match.scriptName || match.scriptTitle, id: id, lines: source.split('\\n').length};
-              }
-              return {error: 'Monaco editor not found to inject source', name: match.scriptName || match.scriptTitle};
+              return {success: true, name: match.scriptName || match.scriptTitle, id: id, lines: source.split('\\n').length, source: source};
             });
         })
         .catch(function(e) { return {error: e.message}; });
@@ -584,6 +618,8 @@ export async function openScript({ name }) {
   if (result?.error) {
     throw new Error(result.error);
   }
+
+  await pasteIntoEditor(result.source);
 
   return { success: true, name: result.name, script_id: result.id, lines: result.lines, source: 'internal_api', opened: true };
 }
